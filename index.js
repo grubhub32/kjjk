@@ -1,32 +1,49 @@
 const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder } = require('discord.js');
 const axios = require('axios');
+require('dotenv').config();
 
-// Bot configuration
+// Bot configuration from environment variables
 const config = {
-    token: 'YMTM3OTU4OTU5NjMyODc1OTMxNg.G1tAiG.xT8eyog7_cMArUMX2x4iOMH5QEgtOaVEqbqe6Y',
+    token: process.env.DISCORD_TOKEN,
     
-    // Llama API Configuration (adjust based on your setup)
-    llamaApiUrl: 'http://localhost:11434/api/generate', // Ollama default
-    // llamaApiUrl: 'https://your-llama-api-endpoint.com/v1/chat/completions', // Alternative API
-    
-    model: 'llama3.1:8b', // Ollama model name
-    // model: 'llama-3.1-8b-instant', // Alternative API model name
+    // Llama API Configuration
+    llamaApiUrl: process.env.LLAMA_API_URL || 'http://localhost:11434/api/generate',
+    model: process.env.LLAMA_MODEL || 'llama3.1:8b',
+    apiKey: process.env.LLAMA_API_KEY, // Optional, for APIs that require authentication
     
     // Bot behavior settings
-    maxTokens: 500,
-    temperature: 0.7,
-    systemPrompt: `You are a helpful and friendly Discord chatbot. Keep your responses conversational, engaging, and appropriate for a Discord server. Be concise but informative. You can discuss various topics, help with questions, and engage in casual conversation.`,
+    maxTokens: parseInt(process.env.MAX_TOKENS) || 500,
+    temperature: parseFloat(process.env.TEMPERATURE) || 0.7,
+    systemPrompt: process.env.SYSTEM_PROMPT || `You are a helpful and friendly Discord chatbot. Keep your responses conversational, engaging, and appropriate for a Discord server. Be concise but informative. You can discuss various topics, help with questions, and engage in casual conversation.`,
     
     // Channel settings
-    allowedChannels: [], // Empty = all channels, or specify channel IDs: ['123456789', '987654321']
-    botMention: true, // Respond when mentioned
-    directMessage: true, // Respond to DMs
-    channelChat: false, // Respond to all messages in allowed channels (can be spammy)
+    allowedChannels: process.env.ALLOWED_CHANNELS ? process.env.ALLOWED_CHANNELS.split(',') : [],
+    botMention: process.env.BOT_MENTION !== 'false', // Default true
+    directMessage: process.env.DIRECT_MESSAGE !== 'false', // Default true
+    channelChat: process.env.CHANNEL_CHAT === 'true', // Default false
     
     // Rate limiting
-    userCooldown: 3000, // 3 seconds between requests per user
-    maxMessageLength: 2000 // Discord's message limit
+    userCooldown: parseInt(process.env.USER_COOLDOWN) || 3000, // 3 seconds
+    maxMessageLength: parseInt(process.env.MAX_MESSAGE_LENGTH) || 2000 // Discord's limit
 };
+
+// Validate required environment variables
+if (!config.token) {
+    console.error('❌ DISCORD_TOKEN is required in .env file');
+    process.exit(1);
+}
+
+console.log('🔧 Bot Configuration:');
+console.log(`   Model: ${config.model}`);
+console.log(`   API URL: ${config.llamaApiUrl}`);
+console.log(`   Max Tokens: ${config.maxTokens}`);
+console.log(`   Temperature: ${config.temperature}`);
+console.log(`   Bot Mention: ${config.botMention}`);
+console.log(`   Direct Messages: ${config.directMessage}`);
+console.log(`   Channel Chat: ${config.channelChat}`);
+console.log(`   Allowed Channels: ${config.allowedChannels.length > 0 ? config.allowedChannels.join(', ') : 'All'}`);
+console.log(`   User Cooldown: ${config.userCooldown}ms`);
+console.log('');
 
 // Initialize Discord client
 const client = new Client({
@@ -126,12 +143,18 @@ async function generateResponse(prompt, userId) {
             // temperature: config.temperature
         };
         
+        const headers = {
+            'Content-Type': 'application/json'
+        };
+        
+        // Add API key if provided
+        if (config.apiKey) {
+            headers['Authorization'] = `Bearer ${config.apiKey}`;
+        }
+        
         const response = await axios.post(config.llamaApiUrl, requestData, {
             timeout: 30000,
-            headers: {
-                'Content-Type': 'application/json',
-                // 'Authorization': 'Bearer YOUR_API_KEY' // If required
-            }
+            headers: headers
         });
         
         // Extract response based on API format
