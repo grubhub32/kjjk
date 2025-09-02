@@ -1,371 +1,477 @@
-const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder } = require('discord.js');
-const axios = require('axios');
+const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ApplicationCommandOptionType, ChannelType } = require('discord.js');
+const { REST } = require('@discordjs/rest');
+const { Routes } = require('discord-api-types/v10');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
 
-// Bot configuration from environment variables
-const config = {
-    token: process.env.DISCORD_TOKEN,
-    
-    // Llama API Configuration
-    llamaApiUrl: process.env.LLAMA_API_URL || 'http://localhost:11434/api/generate',
-    model: process.env.LLAMA_MODEL || 'llama3.1:8b',
-    apiKey: process.env.LLAMA_API_KEY, // Optional, for APIs that require authentication
-    
-    // Bot behavior settings
-    maxTokens: parseInt(process.env.MAX_TOKENS) || 500,
-    temperature: parseFloat(process.env.TEMPERATURE) || 0.7,
-    systemPrompt: process.env.SYSTEM_PROMPT || `You are a helpful and friendly Discord chatbot. Keep your responses conversational, engaging, and appropriate for a Discord server. Be concise but informative. You can discuss various topics, help with questions, and engage in casual conversation.`,
-    
-    // Channel settings
-    allowedChannels: process.env.ALLOWED_CHANNELS ? process.env.ALLOWED_CHANNELS.split(',') : [],
-    botMention: process.env.BOT_MENTION !== 'false', // Default true
-    directMessage: process.env.DIRECT_MESSAGE !== 'false', // Default true
-    channelChat: process.env.CHANNEL_CHAT === 'true', // Default false
-    
-    // Rate limiting
-    userCooldown: parseInt(process.env.USER_COOLDOWN) || 3000, // 3 seconds
-    maxMessageLength: parseInt(process.env.MAX_MESSAGE_LENGTH) || 2000 // Discord's limit
-};
+// Configuration
+const MOD_ROLE_NAME = "Moderator";
+const ADMIN_ROLE_NAME = "Administrator";
+const LOG_CHANNEL_NAME = "mod-logs";
 
-// Validate required environment variables
-if (!config.token) {
-    console.error('❌ DISCORD_TOKEN is required in .env file');
-    process.exit(1);
-}
-
-console.log('🔧 Bot Configuration:');
-console.log(`   Model: ${config.model}`);
-console.log(`   API URL: ${config.llamaApiUrl}`);
-console.log(`   Max Tokens: ${config.maxTokens}`);
-console.log(`   Temperature: ${config.temperature}`);
-console.log(`   Bot Mention: ${config.botMention}`);
-console.log(`   Direct Messages: ${config.directMessage}`);
-console.log(`   Channel Chat: ${config.channelChat}`);
-console.log(`   Allowed Channels: ${config.allowedChannels.length > 0 ? config.allowedChannels.join(', ') : 'All'}`);
-console.log(`   User Cooldown: ${config.userCooldown}ms`);
-console.log('');
-
-// Initialize Discord client
+// Initialize clients
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildModeration
     ]
 });
 
-// Store conversation history and user cooldowns
-const conversationHistory = new Map(); // userId -> array of messages
-const userCooldowns = new Map(); // userId -> timestamp
-const typingUsers = new Set(); // users currently being "typed" to
+// Initialize Gemini with correct configuration
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Utility functions
-function isOnCooldown(userId) {
-    const cooldown = userCooldowns.get(userId);
-    if (!cooldown) return false;
-    
-    const timeLeft = cooldown + config.userCooldown - Date.now();
-    return timeLeft > 0;
-}
+// Data storage
+const warnings = new Map();
+const notes = new Map();
+const cases = new Map();
+let caseCounter = 1;
+const serverConfig = new Map();
+const aiModerationEnabled = new Map();
 
-function setCooldown(userId) {
-    userCooldowns.set(userId, Date.now());
-}
-
-function shouldRespond(message) {
-    // Don't respond to bots
-    if (message.author.bot) return false;
-    
-    // Always respond to DMs
-    if (message.channel.type === 1 && config.directMessage) return true;
-    
-    // Check if in allowed channels
-    if (config.allowedChannels.length > 0 && !config.allowedChannels.includes(message.channel.id)) {
-        return false;
-    }
-    
-    // Check if bot was mentioned
-    if (config.botMention && message.mentions.has(client.user)) return true;
-    
-    // Check if should respond to all channel messages
-    if (config.channelChat && message.channel.type === 0) return true;
-    
-    return false;
-}
-
-function getConversationHistory(userId, limit = 10) {
-    const history = conversationHistory.get(userId) || [];
-    return history.slice(-limit);
-}
-
-function addToHistory(userId, role, content) {
-    if (!conversationHistory.has(userId)) {
-        conversationHistory.set(userId, []);
-    }
-    
-    const history = conversationHistory.get(userId);
-    history.push({ role, content, timestamp: Date.now() });
-    
-    // Keep only last 20 messages to prevent memory issues
-    if (history.length > 20) {
-        history.splice(0, history.length - 20);
-    }
-}
-
-// Llama API integration
-async function generateResponse(prompt, userId) {
-    try {
-        const history = getConversationHistory(userId);
-        
-        // Prepare messages for the API
-        const messages = [
-            { role: 'system', content: config.systemPrompt },
-            ...history,
-            { role: 'user', content: prompt }
-        ];
-        
-        // Different API formats based on your setup
-        const requestData = {
-            // Ollama format
-            model: config.model,
-            prompt: formatPromptForOllama(messages),
-            stream: false,
-            options: {
-                temperature: config.temperature,
-                num_predict: config.maxTokens
+// Slash commands configuration
+const commands = [
+    {
+        name: 'warn',
+        description: 'Issue a warning to a user',
+        options: [
+            {
+                name: 'user',
+                type: ApplicationCommandOptionType.User,
+                description: 'The user to warn',
+                required: true
+            },
+            {
+                name: 'reason',
+                type: ApplicationCommandOptionType.String,
+                description: 'Reason for the warning',
+                required: false
             }
-            
-            // Alternative OpenAI-compatible format (uncomment if using different API):
-            // model: config.model,
-            // messages: messages,
-            // max_tokens: config.maxTokens,
-            // temperature: config.temperature
-        };
-        
-        const headers = {
-            'Content-Type': 'application/json'
-        };
-        
-        // Add API key if provided
-        if (config.apiKey) {
-            headers['Authorization'] = `Bearer ${config.apiKey}`;
-        }
-        
-        const response = await axios.post(config.llamaApiUrl, requestData, {
-            timeout: 30000,
-            headers: headers
+        ]
+    },
+    {
+        name: 'mute',
+        description: 'Temporarily mute a user',
+        options: [
+            {
+                name: 'user',
+                type: ApplicationCommandOptionType.User,
+                description: 'The user to mute',
+                required: true
+            },
+            {
+                name: 'duration',
+                type: ApplicationCommandOptionType.String,
+                description: 'Duration (e.g., 1h, 30m)',
+                required: true
+            },
+            {
+                name: 'reason',
+                type: ApplicationCommandOptionType.String,
+                description: 'Reason for the mute',
+                required: false
+            }
+        ]
+    },
+    {
+        name: 'kick',
+        description: 'Kick a user from the server',
+        options: [
+            {
+                name: 'user',
+                type: ApplicationCommandOptionType.User,
+                description: 'The user to kick',
+                required: true
+            },
+            {
+                name: 'reason',
+                type: ApplicationCommandOptionType.String,
+                description: 'Reason for the kick',
+                required: false
+            }
+        ]
+    },
+    {
+        name: 'ban',
+        description: 'Ban a user from the server',
+        options: [
+            {
+                name: 'user',
+                type: ApplicationCommandOptionType.User,
+                description: 'The user to ban',
+                required: true
+            },
+            {
+                name: 'days',
+                type: ApplicationCommandOptionType.Integer,
+                description: 'Days of messages to delete (0-7)',
+                required: false,
+                min_value: 0,
+                max_value: 7
+            },
+            {
+                name: 'reason',
+                type: ApplicationCommandOptionType.String,
+                description: 'Reason for the ban',
+                required: false
+            }
+        ]
+    },
+    {
+        name: 'ai_scan',
+        description: 'Scan recent messages for toxic content using Gemini',
+        options: [
+            {
+                name: 'channel',
+                type: ApplicationCommandOptionType.Channel,
+                description: 'Channel to scan',
+                required: false,
+                channel_types: [ChannelType.GuildText]
+            },
+            {
+                name: 'limit',
+                type: ApplicationCommandOptionType.Integer,
+                description: 'Number of messages to scan (1-25)',
+                required: false,
+                min_value: 1,
+                max_value: 25
+            }
+        ]
+    },
+    {
+        name: 'ai_analyze',
+        description: 'Analyze a specific message using Gemini',
+        options: [
+            {
+                name: 'message_id',
+                type: ApplicationCommandOptionType.String,
+                description: 'ID of the message to analyze',
+                required: true
+            }
+        ]
+    },
+    {
+        name: 'ai_toggle',
+        description: 'Enable or disable AI auto-moderation',
+        options: [
+            {
+                name: 'status',
+                type: ApplicationCommandOptionType.String,
+                description: 'Enable or disable AI moderation',
+                required: true,
+                choices: [
+                    { name: 'Enable', value: 'enable' },
+                    { name: 'Disable', value: 'disable' }
+                ]
+            }
+        ]
+    },
+    {
+        name: 'ping',
+        description: 'Check bot latency'
+    }
+];
+
+// Helper functions
+async function getModChannel(guild) {
+    if (serverConfig.has(guild.id) && serverConfig.get(guild.id).log_channel) {
+        return guild.channels.cache.get(serverConfig.get(guild.id).log_channel);
+    }
+    return guild.channels.cache.find(ch => ch.name === LOG_CHANNEL_NAME);
+}
+
+async function logAction(action, moderator, target, reason = null, duration = null) {
+    const channel = await getModChannel(moderator.guild);
+    if (!channel) return;
+
+    const embed = new EmbedBuilder()
+        .setTitle(`Case #${caseCounter} | ${action}`)
+        .setColor(0x0099FF)
+        .setTimestamp()
+        .addFields(
+            { name: 'Moderator', value: moderator.toString(), inline: true },
+            { name: 'Target', value: target.toString(), inline: true }
+        );
+
+    if (reason) embed.addFields({ name: 'Reason', value: reason, inline: false });
+    if (duration) embed.addFields({ name: 'Duration', value: duration, inline: true });
+
+    await channel.send({ embeds: [embed] });
+}
+
+async function hasModPerms(member) {
+    if (member.permissions.has(PermissionsBitField.Flags.ManageMessages)) return true;
+    return member.roles.cache.some(role => [MOD_ROLE_NAME, ADMIN_ROLE_NAME].includes(role.name));
+}
+
+async function hasAdminPerms(member) {
+    if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
+    return member.roles.cache.some(role => role.name === ADMIN_ROLE_NAME);
+}
+
+async function canTargetUser(moderator, target) {
+    if (moderator.id === target.id) return { can: false, error: "You cannot moderate yourself." };
+    if (moderator.roles.highest.position <= target.roles.highest.position && moderator.id !== moderator.guild.ownerId) {
+        return { can: false, error: "You cannot moderate users with equal or higher roles." };
+    }
+    if (target.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        return { can: false, error: "You cannot moderate administrators." };
+    }
+    return { can: true, error: null };
+}
+
+async function aiAnalyzeText(text) {
+    try {
+        // Use the latest model name - try different versions
+        const model = genAI.getGenerativeModel({ 
+            model: "gemini-1.5-flash-latest", // Try this first
+            // model: "gemini-pro", // Fallback
+            generationConfig: {
+                maxOutputTokens: 150,
+                temperature: 0.1
+            }
         });
+
+        const prompt = `Analyze this Discord message for moderation. Respond ONLY with valid JSON, no other text:
+
+{
+  "verdict": "SAFE" or "FLAG",
+  "scores": {
+    "toxicity": 0.0-1.0,
+    "hate_speech": 0.0-1.0,
+    "spam": 0.0-1.0,
+    "harassment": 0.0-1.0
+  }
+}
+
+Message: "${text.substring(0, 500)}"`;
+
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        let analysisText = response.text().trim();
         
-        // Extract response based on API format
-        let aiResponse;
-        if (response.data.response) {
-            // Ollama format
-            aiResponse = response.data.response.trim();
-        } else if (response.data.choices && response.data.choices[0]) {
-            // OpenAI-compatible format
-            aiResponse = response.data.choices[0].message.content.trim();
-        } else {
-            throw new Error('Unexpected API response format');
+        // Clean response - remove markdown code blocks
+        analysisText = analysisText.replace(/```json|```/g, '').trim();
+        
+        // Parse JSON
+        const analysis = JSON.parse(analysisText);
+        
+        // Validate response structure
+        if (analysis && analysis.verdict && analysis.scores) {
+            return analysis;
         }
         
-        // Add to conversation history
-        addToHistory(userId, 'user', prompt);
-        addToHistory(userId, 'assistant', aiResponse);
-        
-        return aiResponse;
-        
+        return null;
     } catch (error) {
-        console.error('❌ Error generating AI response:', error.message);
+        console.error('Gemini API error:', error.message);
         
-        if (error.code === 'ECONNREFUSED') {
-            return "🚫 I'm having trouble connecting to my AI brain right now. Is the Llama server running?";
-        } else if (error.response?.status === 429) {
-            return "⏳ I'm a bit overwhelmed right now. Please try again in a moment!";
-        } else {
-            return "🤖 Oops! Something went wrong with my AI processing. Please try again!";
-        }
-    }
-}
-
-// Format messages for Ollama (simple prompt format)
-function formatPromptForOllama(messages) {
-    let prompt = '';
-    
-    for (const msg of messages) {
-        if (msg.role === 'system') {
-            prompt += `System: ${msg.content}\n\n`;
-        } else if (msg.role === 'user') {
-            prompt += `Human: ${msg.content}\n\n`;
-        } else if (msg.role === 'assistant') {
-            prompt += `Assistant: ${msg.content}\n\n`;
-        }
-    }
-    
-    prompt += 'Assistant: ';
-    return prompt;
-}
-
-// Split long messages for Discord
-function splitMessage(text, maxLength = config.maxMessageLength) {
-    if (text.length <= maxLength) return [text];
-    
-    const messages = [];
-    let current = '';
-    const sentences = text.split('. ');
-    
-    for (const sentence of sentences) {
-        if ((current + sentence + '. ').length > maxLength) {
-            if (current) {
-                messages.push(current.trim());
-                current = sentence + '. ';
-            } else {
-                // Sentence is too long, force split
-                messages.push(sentence.substring(0, maxLength - 3) + '...');
-                current = sentence.substring(maxLength - 3) + '. ';
-            }
-        } else {
-            current += sentence + '. ';
-        }
-    }
-    
-    if (current.trim()) {
-        messages.push(current.trim());
-    }
-    
-    return messages;
-}
-
-// Bot events
-client.once('ready', () => {
-    console.log(`🤖 ${client.user.tag} AI Chatbot is online!`);
-    console.log(`📊 Connected to ${client.guilds.cache.size} servers`);
-    console.log(`🧠 Using model: ${config.model}`);
-    console.log(`🔗 API endpoint: ${config.llamaApiUrl}`);
-    
-    // Set bot status
-    client.user.setActivity('conversations with humans', { type: 'LISTENING' });
-});
-
-// Handle messages
-client.on('messageCreate', async (message) => {
-    try {
-        // Check if should respond
-        if (!shouldRespond(message)) return;
-        
-        // Check cooldown
-        if (isOnCooldown(message.author.id)) {
-            const cooldownEmbed = new EmbedBuilder()
-                .setColor('#FFA500')
-                .setDescription('⏳ Please wait a moment before sending another message!');
-            
-            const cooldownMsg = await message.reply({ embeds: [cooldownEmbed] });
-            setTimeout(() => cooldownMsg.delete().catch(() => {}), 3000);
-            return;
-        }
-        
-        // Set cooldown
-        setCooldown(message.author.id);
-        
-        // Clean the message content (remove bot mention if present)
-        let cleanContent = message.content.replace(/<@!?\d+>/g, '').trim();
-        
-        if (!cleanContent) {
-            cleanContent = "Hello!";
-        }
-        
-        // Show typing indicator
-        if (!typingUsers.has(message.author.id)) {
-            typingUsers.add(message.author.id);
-            message.channel.sendTyping();
-            
-            // Continue typing every 5 seconds if response takes long
-            const typingInterval = setInterval(() => {
-                if (typingUsers.has(message.author.id)) {
-                    message.channel.sendTyping();
-                } else {
-                    clearInterval(typingInterval);
-                }
-            }, 5000);
-        }
-        
-        // Generate AI response
-        const aiResponse = await generateResponse(cleanContent, message.author.id);
-        
-        // Stop typing
-        typingUsers.delete(message.author.id);
-        
-        // Split long responses
-        const messageParts = splitMessage(aiResponse);
-        
-        // Send response(s)
-        for (let i = 0; i < messageParts.length; i++) {
-            const embed = new EmbedBuilder()
-                .setColor('#00D4AA')
-                .setDescription(messageParts[i])
-                .setFooter({ 
-                    text: `🤖 Powered by ${config.model}${messageParts.length > 1 ? ` • Part ${i + 1}/${messageParts.length}` : ''}`,
-                    iconURL: client.user.displayAvatarURL()
+        // Try with different model if first fails
+        if (error.message.includes('not found') || error.status === 404) {
+            console.log('Trying with gemini-pro model...');
+            try {
+                const model = genAI.getGenerativeModel({ 
+                    model: "gemini-1.5-flash-8b",
+                    generationConfig: {
+                        maxOutputTokens: 150,
+                        temperature: 0.1
+                    }
                 });
-            
-            if (i === 0) {
-                await message.reply({ embeds: [embed] });
-            } else {
-                await message.channel.send({ embeds: [embed] });
-            }
-            
-            // Small delay between parts
-            if (i < messageParts.length - 1) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                
+                const result = await model.generateContent(`Analyze: "${text.substring(0, 300)}" - Respond with JSON: {"verdict":"SAFE/FLAG","scores":{"toxicity":0.0,"hate_speech":0.0,"spam":0.0,"harassment":0.0}}`);
+                const response = await result.response;
+                let analysisText = response.text().trim();
+                analysisText = analysisText.replace(/```json|```/g, '').trim();
+                return JSON.parse(analysisText);
+            } catch (fallbackError) {
+                console.error('Fallback model also failed:', fallbackError.message);
+                return null;
             }
         }
         
+        return null;
+    }
+}
+
+// Register slash commands
+async function registerCommands() {
+    try {
+        const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+        console.log('Slash commands registered!');
     } catch (error) {
-        console.error('❌ Error handling message:', error);
-        typingUsers.delete(message.author.id);
-        
-        const errorEmbed = new EmbedBuilder()
-            .setColor('#FF0000')
-            .setTitle('❌ Error')
-            .setDescription('Sorry, I encountered an error while processing your message. Please try again!');
-        
-        message.reply({ embeds: [errorEmbed] }).catch(() => {});
+        console.error('Error registering commands:', error);
+    }
+}
+
+// Event handlers
+client.once('ready', () => {
+    console.log(`✅ Bot logged in as ${client.user.tag}`);
+    console.log('🎯 Using FREE Gemini API for moderation');
+    registerCommands();
+});
+
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isCommand()) return;
+
+    const { commandName, options, member, guild } = interaction;
+
+    try {
+        switch (commandName) {
+            case 'warn':
+                if (!await hasModPerms(member)) {
+                    return interaction.reply({ content: "❌ No permission.", ephemeral: true });
+                }
+
+                const user = options.getUser('user');
+                const reason = options.getString('reason') || 'No reason provided';
+                const targetMember = await guild.members.fetch(user.id);
+
+                const canAct = await canTargetUser(member, targetMember);
+                if (!canAct.can) return interaction.reply({ content: canAct.error, ephemeral: true });
+
+                if (!warnings.has(user.id)) warnings.set(user.id, []);
+                warnings.get(user.id).push({ moderator: member.id, reason, timestamp: new Date().toISOString() });
+
+                cases.set(caseCounter, { action: 'warn', moderator: member.id, target: user.id, reason, timestamp: new Date().toISOString() });
+
+                await logAction('Warn', member, user, reason);
+                await interaction.reply(`⚠️ ${user} warned. Reason: ${reason}`);
+                caseCounter++;
+                break;
+
+            case 'ai_scan':
+                if (!await hasAdminPerms(member)) {
+                    return interaction.reply({ content: "❌ Admin only.", ephemeral: true });
+                }
+
+                const channel = options.getChannel('channel') || interaction.channel;
+                const limit = Math.min(options.getInteger('limit') || 15, 25);
+
+                await interaction.deferReply({ ephemeral: true });
+
+                const messages = await channel.messages.fetch({ limit });
+                const flagged = [];
+
+                for (const message of messages.values()) {
+                    if (message.author.bot) continue;
+                    
+                    const analysis = await aiAnalyzeText(message.content);
+                    if (analysis?.verdict === 'FLAG') {
+                        flagged.push({ message, analysis });
+                    }
+                    
+                    // Rate limiting for free tier
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                }
+
+                if (flagged.length > 0) {
+                    let report = `🔍 Found ${flagged.length} flagged messages:\n`;
+                    for (const item of flagged.slice(0, 5)) {
+                        const highScores = Object.entries(item.analysis.scores)
+                            .filter(([_, score]) => score > 0.6)
+                            .map(([key]) => key);
+                        report += `- ${item.message.author}: "${item.message.content.slice(0, 50)}..." (${highScores.join(', ')})\n`;
+                    }
+                    await interaction.editReply(report);
+                } else {
+                    await interaction.editReply("✅ No problematic messages found.");
+                }
+                break;
+
+            case 'ai_analyze':
+                const messageId = options.getString('message_id');
+                try {
+                    const message = await interaction.channel.messages.fetch(messageId);
+                    await interaction.deferReply();
+
+                    const analysis = await aiAnalyzeText(message.content);
+                    
+                    if (analysis) {
+                        const embed = new EmbedBuilder()
+                            .setTitle('🧠 AI Analysis')
+                            .setColor(analysis.verdict === 'SAFE' ? 0x00FF00 : 0xFF0000)
+                            .addFields({ name: 'Verdict', value: analysis.verdict, inline: true });
+
+                        for (const [category, score] of Object.entries(analysis.scores)) {
+                            embed.addFields({
+                                name: category.toUpperCase(),
+                                value: `${(score * 100).toFixed(0)}%`,
+                                inline: true
+                            });
+                        }
+
+                        await interaction.editReply({ embeds: [embed] });
+                    } else {
+                        await interaction.editReply("❌ Analysis failed. Check API key and model availability.");
+                    }
+                } catch {
+                    await interaction.reply({ content: "❌ Message not found.", ephemeral: true });
+                }
+                break;
+
+            case 'ai_toggle':
+                if (!await hasAdminPerms(member)) {
+                    return interaction.reply({ content: "❌ Admin only.", ephemeral: true });
+                }
+
+                const status = options.getString('status');
+                aiModerationEnabled.set(guild.id, status === 'enable');
+                await interaction.reply({ content: `✅ AI moderation ${status}d.`, ephemeral: true });
+                break;
+
+            case 'ping':
+                await interaction.reply({ content: `🏓 Pong! ${Math.round(client.ws.ping)}ms`, ephemeral: true });
+                break;
+
+            default:
+                await interaction.reply({ content: "⚡ Command ready!", ephemeral: true });
+        }
+    } catch (error) {
+        console.error('Command error:', error);
+        await interaction.reply({ content: "❌ Error executing command.", ephemeral: true });
     }
 });
 
-// Slash command for clearing conversation history
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isChatInputCommand()) return;
-    
-    if (interaction.commandName === 'clear-history') {
-        conversationHistory.delete(interaction.user.id);
+// Auto-moderation
+client.on('messageCreate', async message => {
+    if (message.author.bot || !message.guild || message.content.startsWith('/')) return;
+    if (!(aiModerationEnabled.get(message.guild.id) ?? true)) return;
+
+    try {
+        const analysis = await aiAnalyzeText(message.content);
         
-        const embed = new EmbedBuilder()
-            .setColor('#00FF00')
-            .setDescription('🗑️ Your conversation history has been cleared!');
-        
-        await interaction.reply({ embeds: [embed], ephemeral: true });
+        if (analysis?.verdict === 'FLAG') {
+            const logChannel = await getModChannel(message.guild);
+            if (logChannel) {
+                const embed = new EmbedBuilder()
+                    .setTitle('🚨 Flagged Message')
+                    .setDescription(message.content.slice(0, 1000))
+                    .setColor(0xFF0000)
+                    .addFields(
+                        { name: 'Author', value: message.author.toString(), inline: true },
+                        { name: 'Channel', value: message.channel.toString(), inline: true }
+                    );
+
+                await logChannel.send({ embeds: [embed] });
+                try {
+                    await message.react('⚠️');
+                } catch (e) {
+                    console.log('Could not add reaction');
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Auto-mod error:', error.message);
     }
 });
 
 // Error handling
-client.on('error', error => {
-    console.error('❌ Discord client error:', error);
+client.on('error', console.error);
+
+// Login with error handling
+client.login(process.env.DISCORD_TOKEN).catch(error => {
+    console.error('Login failed:', error.message);
+    console.log('Please check your DISCORD_TOKEN in the .env file');
 });
-
-process.on('unhandledRejection', error => {
-    console.error('❌ Unhandled promise rejection:', error);
-});
-
-// Graceful shutdown
-process.on('SIGINT', () => {
-    console.log('🛑 Shutting down gracefully...');
-    client.destroy();
-    process.exit(0);
-});
-
-// Login to Discord
-client.login(config.token);
-
-// Export for testing
-module.exports = { client, config };
